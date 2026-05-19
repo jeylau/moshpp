@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moshpp"
+version = "4.0.0a0"
+description = "MoSh++ — torch port."
+readme = "README.md"
+requires-python = ">=3.11, <3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "Nima Ghorbani" }]
+dependencies = [
+    "numpy",
+    "torch",
+    "smplx",
+    "pytorch3d==0.7.8+pt2.8.0cpu",
+    "human-body-prior",
+    "loguru",
+    "omegaconf",
+    "pyrender>=0.1.45",
+    "imageio==2.37.2",
+    "imageio-ffmpeg>=0.6.0",
+]
+
+[project.optional-dependencies]
+# Legacy chumpy path (chmosh.py, scan2mesh, MocapSession). Not needed for torch_impl.
+legacy = [
+    "chumpy",
+    "opencv-python",
+    "scikit-learn",
+    "matplotlib",
+    "ezc3d",
+    "cython==0.29",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+pytorch3d = { index = "torch-packages" }
+human-body-prior = { git = "https://github.com/nghorbani/human_body_prior.git" }
+
+[[tool.uv.index]]
+name = "torch-packages"
+url = "https://miropsota.github.io/torch_packages_builder"
+explicit = true
