@@ -63,13 +63,20 @@ def fit_smpl_to_markers(
     stagei_frame_ids: Optional[List[int]] = None,
     stagei_num_frames: int = 12,
     run_stage_i: bool = True,
+    betas: Optional[Union[np.ndarray, torch.Tensor]] = None,
     m2b_distance: float = 0.0095,
     device: Optional[str] = None,
     stagei_cfg: Optional[StageICfg] = None,
     stageii_cfg: Optional[StageIICfg] = None,
     stageii_batch_size: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Fit SMPL-H to a sequence of labeled 3D markers."""
+    """Fit SMPL-H to a sequence of labeled 3D markers.
+
+    If ``betas`` is provided, stage I is bypassed entirely and the marker
+    layout is constructed on the betas-conditioned canonical body. Use this
+    when you have a known body shape (e.g. AMASS fit) and only want to recover
+    per-frame pose against new mocap data.
+    """
     assert markers.ndim == 3 and markers.shape[2] == 3, "markers must be (T, M, 3)"
     assert markers.shape[1] == len(labels), (
         "labels length must match markers' second dim"
@@ -104,8 +111,39 @@ def fit_smpl_to_markers(
     )
     vposer = FrozenVPoser(vposer_dir, device=dev)
 
-    # ----- Stage I -----
-    if run_stage_i:
+    # ----- Stage I (or bypass) -----
+    from moshpp.torch_impl.fit import _vertex_normals
+
+    if betas is not None:
+        # User-supplied betas: skip stage I, build marker layout on the
+        # betas-conditioned canonical body.
+        logger.info("skipping stage I — using user-supplied betas")
+        betas_t = torch.as_tensor(betas, dtype=torch.float32, device=dev).flatten()
+        if betas_t.shape[0] < num_betas:
+            pad = torch.zeros(num_betas - betas_t.shape[0], device=dev)
+            betas_t = torch.cat([betas_t, pad])
+        elif betas_t.shape[0] > num_betas:
+            logger.warning(
+                f"truncating provided betas from {betas_t.shape[0]} to {num_betas}"
+            )
+            betas_t = betas_t[:num_betas]
+        with torch.no_grad():
+            can_verts = body_model.canonical_verts(betas_t)
+        can_normals = _vertex_normals(can_verts, body_model.faces)
+        init_markers = (
+            can_verts[marker_vids_t] + can_normals[marker_vids_t] * m2b_distance
+        )
+        nn_idx, coeffs = build_local_frame(can_verts, init_markers)
+        betas = betas_t.detach()
+        markers_latent = init_markers
+        stagei_out = {
+            "betas": betas,
+            "markers_latent": markers_latent,
+            "nn_idx": nn_idx,
+            "coeffs": coeffs,
+            "latent_labels": latent_labels,
+        }
+    elif run_stage_i:
         if stagei_frame_ids is None:
             stagei_frame_ids = (
                 np.linspace(0, markers.shape[0] - 1, num=stagei_num_frames)
@@ -133,7 +171,6 @@ def fit_smpl_to_markers(
         # v0: zero betas, marker positions = template_vertex + normal * d
         logger.info("skipping stage I — using zero betas and template marker positions")
         v_template = body_model.template_vertices()
-        from moshpp.torch_impl.fit import _vertex_normals
 
         vert_normals = _vertex_normals(v_template, body_model.faces)
         init_markers = (

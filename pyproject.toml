@@ -18,9 +18,6 @@ dependencies = [
     "human-body-prior",
     "loguru",
     "omegaconf",
-    "pyrender>=0.1.45",
-    "imageio==2.37.2",
-    "imageio-ffmpeg>=0.6.0",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +29,11 @@ legacy = [
     "matplotlib",
     "ezc3d",
     "cython==0.29",
+]
+
+viz = [
+    "aitviewer>=1.14.2",
+    "ezc3d>=1.7.0",
 ]
 
 [tool.setuptools]

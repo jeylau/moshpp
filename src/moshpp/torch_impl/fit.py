@@ -143,7 +143,12 @@ def _seed_root_from_rigid(
 class StageICfg:
     num_betas: int = 10
     optimize_betas: bool = True
-    m2b_distance: float = 0.0095  # meters, used only for initial marker placement
+    # If False, markers are pinned at vertex_i + normal_i * m2b_distance on the
+    # betas-conditioned canonical body, with no free drift. Without the legacy
+    # surface loss, free markers + free betas are jointly under-constrained and
+    # the optimizer absorbs shape errors into marker drift instead of betas.
+    optimize_markers_latent: bool = True
+    m2b_distance: float = 0.0095
     anneal: List[float] = field(default_factory=lambda: [10.0, 5.0, 2.0, 1.0, 0.5])
     wt_data: float = 1000.0
     wt_init: float = 50.0
@@ -207,8 +212,13 @@ def mosh_stagei(
     # Build local frame from the *initial* marker positions on the T-pose.
     nn_idx, coeffs = build_local_frame(v_template, init_markers)
 
-    # Free variables
-    markers_latent = nn.Parameter(init_markers.clone())
+    # Free variables. markers_latent is only optimized when explicitly requested;
+    # otherwise the markers are pinned at v[vid] + n[vid]*d on the betas-conditioned
+    # canonical body inside the closure (gradient still flows to betas through that).
+    if cfg.optimize_markers_latent:
+        markers_latent = nn.Parameter(init_markers.clone())
+    else:
+        markers_latent = init_markers  # buffer, not a Parameter
     betas = nn.Parameter(torch.zeros(cfg.num_betas, device=device))
     z = nn.Parameter(torch.zeros(N, LATENT_DIM, device=device))
     global_orient = nn.Parameter(torch.zeros(N, 3, device=device))
@@ -227,7 +237,9 @@ def mosh_stagei(
             global_orient[f_idx].copy_(aa)
             transl[f_idx].copy_(transl_smpl)
 
-    params = [markers_latent, z, global_orient, transl]
+    params = [z, global_orient, transl]
+    if cfg.optimize_markers_latent:
+        params.append(markers_latent)
     if cfg.optimize_betas:
         params.append(betas)
 
@@ -255,18 +267,29 @@ def mosh_stagei(
 
         def closure():
             optimizer.zero_grad()
-            # Recompute coeffs every iteration so markers_latent (and betas, via the
-            # canonical body verts) actually flow through to the data residual.
-            # This mirrors chumpy's TransformedCoeffs.on_changed in MoSh++.
+            # Recompute coeffs every iteration so the marker layout (and betas, via
+            # the canonical body verts) actually flow through to the data residual.
             can_verts = body_model.canonical_verts(betas)  # (V, 3)
-            live_coeffs = compute_coeffs(can_verts, markers_latent, nn_idx)  # (M, 3)
+            if cfg.optimize_markers_latent:
+                live_coeffs = compute_coeffs(can_verts, markers_latent, nn_idx)
+            else:
+                # Marker positions glued to v[vid] + n[vid] * d on the *current*
+                # canonical body. The vertex term carries gradient back to betas.
+                can_normals = _vertex_normals(can_verts, faces)
+                live_markers = (
+                    can_verts[marker_vids] + can_normals[marker_vids] * cfg.m2b_distance
+                )
+                live_coeffs = compute_coeffs(can_verts, live_markers, nn_idx)
             body_pose = vposer.decode_aa(z)  # (N, 63)
             betas_b = betas.unsqueeze(0).expand(N, -1)  # (N, num_betas)
             verts = body_model(betas_b, body_pose, global_orient, transl)  # (N, V, 3)
             sim_markers = synth_markers(verts, nn_idx, live_coeffs)  # (N, M, 3)
 
             data_term = _data_residual(sim_markers, stagei_frames)
-            init_term = ((markers_latent - init_markers) ** 2).sum()
+            if cfg.optimize_markers_latent:
+                init_term = ((markers_latent - init_markers) ** 2).sum()
+            else:
+                init_term = sim_markers.new_zeros(())
             z_term = (z**2).sum()
             betas_term = (
                 (betas**2).sum()
@@ -288,7 +311,15 @@ def mosh_stagei(
         # Diagnostics: data RMSE (independent of weights) + how far betas / markers moved.
         with torch.no_grad():
             can_verts = body_model.canonical_verts(betas)
-            live_coeffs = compute_coeffs(can_verts, markers_latent, nn_idx)
+            if cfg.optimize_markers_latent:
+                live_coeffs = compute_coeffs(can_verts, markers_latent, nn_idx)
+                live_markers_dbg = markers_latent
+            else:
+                can_normals = _vertex_normals(can_verts, faces)
+                live_markers_dbg = (
+                    can_verts[marker_vids] + can_normals[marker_vids] * cfg.m2b_distance
+                )
+                live_coeffs = compute_coeffs(can_verts, live_markers_dbg, nn_idx)
             body_pose = vposer.decode_aa(z)
             betas_b = betas.unsqueeze(0).expand(N, -1)
             verts = body_model(betas_b, body_pose, global_orient, transl)
@@ -297,19 +328,29 @@ def mosh_stagei(
             rmse_mm = (data_se / max(n_obs_total, 1)) ** 0.5 * 1000.0
             betas_norm = float(betas.norm())
             mlat_drift_mm = (
-                float((markers_latent - init_markers_snapshot).norm(dim=-1).mean())
+                float((live_markers_dbg - init_markers_snapshot).norm(dim=-1).mean())
                 * 1000.0
             )
+        drift_label = (
+            "Δmarkers_latent" if cfg.optimize_markers_latent else "Δcan_markers"
+        )
         logger.info(
             f"  loss={float(loss):.2f}  data_RMSE={rmse_mm:.1f}mm  "
-            f"|betas|={betas_norm:.3f}  mean |Δmarkers_latent|={mlat_drift_mm:.2f}mm"
+            f"|betas|={betas_norm:.3f}  mean |{drift_label}|={mlat_drift_mm:.2f}mm"
         )
 
-    # Bake the final coeffs from the optimized markers_latent + final betas, so
+    # Bake the final coeffs from the converged marker layout + final betas, so
     # stage II sees a marker placement that's consistent with the learned shape.
     with torch.no_grad():
         can_verts_final = body_model.canonical_verts(betas)
-        final_coeffs = compute_coeffs(can_verts_final, markers_latent, nn_idx)
+        if cfg.optimize_markers_latent:
+            final_markers_latent = markers_latent
+        else:
+            n_final = _vertex_normals(can_verts_final, faces)
+            final_markers_latent = (
+                can_verts_final[marker_vids] + n_final[marker_vids] * cfg.m2b_distance
+            )
+        final_coeffs = compute_coeffs(can_verts_final, final_markers_latent, nn_idx)
         body_pose = vposer.decode_aa(z)
         betas_b = betas.unsqueeze(0).expand(N, -1)
         verts = body_model(betas_b, body_pose, global_orient, transl)
@@ -321,7 +362,7 @@ def mosh_stagei(
 
     return {
         "betas": betas.detach(),
-        "markers_latent": markers_latent.detach(),
+        "markers_latent": final_markers_latent.detach(),
         "nn_idx": nn_idx,
         "coeffs": final_coeffs.detach(),
         "latent_labels": latent_labels,
