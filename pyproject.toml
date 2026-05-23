@@ -18,6 +18,7 @@ dependencies = [
     "human-body-prior",
     "loguru",
     "omegaconf",
+    "ipykernel",
 ]
 
 [project.optional-dependencies]

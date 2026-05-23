@@ -149,13 +149,38 @@ class StageICfg:
     # the optimizer absorbs shape errors into marker drift instead of betas.
     optimize_markers_latent: bool = True
     m2b_distance: float = 0.0095
-    anneal: List[float] = field(default_factory=lambda: [10.0, 5.0, 2.0, 1.0, 0.5])
-    wt_data: float = 1000.0
-    wt_init: float = 50.0
-    wt_z: float = 5.0
-    wt_betas: float = 1.0
+    # Anneal schedule matching legacy chmosh.py stagei_wt_annealing for SMPL-H.
+    # `wt_data` scales inversely with anneal (data weight grows late); `wt_init`,
+    # `wt_z`, `wt_betas` scale proportionally (priors shrink late). `wt_surf` is
+    # flat across steps.
+    anneal: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
+    # Default weights match legacy stage I (chmosh.py opt_weights.smplh):
+    #   wt_data=75, wt_init=300, wt_pose=3, wt_betas=10, wt_surf=10000.
+    # Tuned for marker-count of ~46; legacy scaled wt_data by (46/M), which we
+    # don't replicate — callers with very different M may want to adjust.
+    wt_data: float = 75.0
+    wt_init: float = 300.0
+    wt_z: float = 3.0  # analog of legacy wt_poseB (VPoser latent prior)
+    wt_betas: float = 10.0
+    # Iso-surface constraint: pin each marker's normal-direction offset in its
+    # local frame (coeffs[:, 1], see markers.py:_local_frame where f2 is the
+    # triangle normal) to ±m2b_distance. Replaces the legacy scan2mesh `surf`
+    # term. Un-annealed, matches legacy wt_surf=10000.
+    wt_surf: float = 10000.0
     lbfgs_iters: int = 30
     lbfgs_lr: float = 1.0
+    # Refresh nn_idx + init_markers against the current betas and marker
+    # positions between anneal steps. Legacy chumpy recomputed 3-NN every
+    # iteration; refreshing between LBFGS restarts keeps the in-step graph
+    # stable while still tracking markers that slide tangentially.
+    refresh_between_steps: bool = True
+    # Hold markers_latent frozen for the first `markers_latent_free_from_step`
+    # anneal steps, letting betas + z absorb the bulk of the data residual
+    # before markers are allowed to refine. Otherwise the optimizer cheats by
+    # sliding markers along the body instead of moving `z` away from the rest
+    # pose (which carries a stronger prior under VPoser than under the legacy
+    # GMM pose prior). Set to 0 to free markers from step 1.
+    markers_latent_free_from_step: int = 2
 
 
 @dataclass
@@ -211,6 +236,11 @@ def mosh_stagei(
 
     # Build local frame from the *initial* marker positions on the T-pose.
     nn_idx, coeffs = build_local_frame(v_template, init_markers)
+    # Iso-surface target for the surf term: each marker's coeffs[:, 1] should
+    # stay at ±m2b_distance. Sign comes from the initial 3-NN triangle winding —
+    # if the marker is outside the body, this sign points "outward" in the
+    # local frame; refresh_between_steps re-derives it whenever nn_idx changes.
+    target_normal_offset = torch.sign(coeffs[:, 1]) * cfg.m2b_distance
 
     # Free variables. markers_latent is only optimized when explicitly requested;
     # otherwise the markers are pinned at v[vid] + n[vid]*d on the betas-conditioned
@@ -237,12 +267,6 @@ def mosh_stagei(
             global_orient[f_idx].copy_(aa)
             transl[f_idx].copy_(transl_smpl)
 
-    params = [z, global_orient, transl]
-    if cfg.optimize_markers_latent:
-        params.append(markers_latent)
-    if cfg.optimize_betas:
-        params.append(betas)
-
     init_markers_snapshot = init_markers.clone()  # for tracking marker drift
     n_obs_total = sum(int(f.obs_xyz.shape[0]) for f in stagei_frames)
 
@@ -251,9 +275,27 @@ def mosh_stagei(
         wt_init = cfg.wt_init * anneal
         wt_z = cfg.wt_z * anneal
         wt_betas = cfg.wt_betas * anneal
+
+        # Stage I has two phases: shape+pose warmup (markers frozen), then
+        # marker refinement. Markers stay frozen until step
+        # `markers_latent_free_from_step` so betas+z absorb the bulk of the
+        # data residual first.
+        markers_free = (
+            cfg.optimize_markers_latent and step >= cfg.markers_latent_free_from_step
+        )
+        if isinstance(markers_latent, nn.Parameter):
+            markers_latent.requires_grad_(markers_free)
+
+        params = [z, global_orient, transl]
+        if markers_free:
+            params.append(markers_latent)
+        if cfg.optimize_betas:
+            params.append(betas)
+
+        phase = "refine" if markers_free else "warmup"
         logger.info(
             f"stagei step {step + 1}/{len(cfg.anneal)} anneal={anneal:.2f} "
-            f"wt_data={wt_data:.1f} wt_init={wt_init:.2f} wt_z={wt_z:.2f}"
+            f"phase={phase} wt_data={wt_data:.1f} wt_init={wt_init:.2f} wt_z={wt_z:.2f}"
         )
 
         optimizer = torch.optim.LBFGS(
@@ -288,8 +330,15 @@ def mosh_stagei(
             data_term = _data_residual(sim_markers, stagei_frames)
             if cfg.optimize_markers_latent:
                 init_term = ((markers_latent - init_markers) ** 2).sum()
+                # Iso-surface constraint: keep coeffs[:, 1] (normal-direction
+                # component in the local frame) at its initial ±m2b_distance.
+                # Markers stay free to slide tangentially via coeffs[:, 0] and
+                # coeffs[:, 2] but cannot drift toward/away from the body to
+                # absorb data residuals that should be going into betas.
+                surf_term = ((live_coeffs[:, 1] - target_normal_offset) ** 2).sum()
             else:
                 init_term = sim_markers.new_zeros(())
+                surf_term = sim_markers.new_zeros(())
             z_term = (z**2).sum()
             betas_term = (
                 (betas**2).sum()
@@ -300,6 +349,7 @@ def mosh_stagei(
             loss = (
                 wt_data * data_term
                 + wt_init * init_term
+                + cfg.wt_surf * surf_term
                 + wt_z * z_term
                 + wt_betas * betas_term
             )
@@ -331,13 +381,45 @@ def mosh_stagei(
                 float((live_markers_dbg - init_markers_snapshot).norm(dim=-1).mean())
                 * 1000.0
             )
+            surf_dev_mm = (
+                float((live_coeffs[:, 1] - target_normal_offset).abs().mean()) * 1000.0
+            )
         drift_label = (
             "Δmarkers_latent" if cfg.optimize_markers_latent else "Δcan_markers"
         )
         logger.info(
             f"  loss={float(loss):.2f}  data_RMSE={rmse_mm:.1f}mm  "
-            f"|betas|={betas_norm:.3f}  mean |{drift_label}|={mlat_drift_mm:.2f}mm"
+            f"|betas|={betas_norm:.3f}  mean |{drift_label}|={mlat_drift_mm:.2f}mm  "
+            f"surf_dev={surf_dev_mm:.2f}mm"
         )
+
+        # Between-step refresh: track markers that slid tangentially, and rebase
+        # the init term + surf target onto the current canonical body. Mirrors
+        # legacy's per-iteration 3-NN recomputation but only between LBFGS
+        # restarts so each in-step graph stays stable.
+        if (
+            cfg.refresh_between_steps
+            and cfg.optimize_markers_latent
+            and step < len(cfg.anneal) - 1
+        ):
+            with torch.no_grad():
+                can_verts_refresh = body_model.canonical_verts(betas)
+                # New 3-NN based on current marker positions on current canonical body
+                nn_idx = compute_nn_idx(can_verts_refresh, markers_latent)
+                refreshed_coeffs = compute_coeffs(
+                    can_verts_refresh, markers_latent, nn_idx
+                )
+                # Preserve outward sign per marker in the new local frame
+                target_normal_offset = (
+                    torch.sign(refreshed_coeffs[:, 1]) * cfg.m2b_distance
+                )
+                # Rebase init target onto current betas-conditioned body so the
+                # init term penalizes tangential drift only, not shape change.
+                can_normals_refresh = _vertex_normals(can_verts_refresh, faces)
+                init_markers = (
+                    can_verts_refresh[marker_vids]
+                    + can_normals_refresh[marker_vids] * cfg.m2b_distance
+                )
 
     # Bake the final coeffs from the converged marker layout + final betas, so
     # stage II sees a marker placement that's consistent with the learned shape.
