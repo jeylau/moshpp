@@ -69,6 +69,7 @@ def fit_smpl_to_markers(
     stagei_cfg: Optional[StageICfg] = None,
     stageii_cfg: Optional[StageIICfg] = None,
     stageii_batch_size: Optional[int] = None,
+    marker_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Fit SMPL-H to a sequence of labeled 3D markers.
 
@@ -76,6 +77,11 @@ def fit_smpl_to_markers(
     layout is constructed on the betas-conditioned canonical body. Use this
     when you have a known body shape (e.g. AMASS fit) and only want to recover
     per-frame pose against new mocap data.
+
+    ``marker_weights`` (optional) overrides the default per-marker weight of
+    1.0 in the data residual. Set to 0.0 to drop a marker entirely (useful for
+    a single bad marker in a single trial). Set >1.0 to boost an anatomically
+    critical marker (e.g. ``{"Sacral": 10.0}`` when PSIS are missing).
     """
     assert markers.ndim == 3 and markers.shape[2] == 3, "markers must be (T, M, 3)"
     assert markers.shape[1] == len(labels), (
@@ -104,6 +110,21 @@ def fit_smpl_to_markers(
         [marker_vids[label] for label in latent_labels], dtype=torch.long, device=dev
     )
     label_to_idx = {label: i for i, label in enumerate(latent_labels)}
+
+    # Per-marker weights (default 1.0 for any label not explicitly overridden).
+    if marker_weights is not None:
+        weights_t = torch.as_tensor(
+            [float(marker_weights.get(l, 1.0)) for l in latent_labels],
+            dtype=torch.float32,
+            device=dev,
+        )
+        nondefault = {
+            l: marker_weights[l] for l in latent_labels if l in marker_weights
+        }
+        if nondefault:
+            logger.info(f"marker weight overrides: {nondefault}")
+    else:
+        weights_t = None
 
     # Body model + VPoser
     body_model = SMPLHBodyModel(
@@ -162,6 +183,7 @@ def fit_smpl_to_markers(
             latent_labels=latent_labels,
             marker_vids=marker_vids_t,
             cfg=si_cfg,
+            marker_weights=weights_t,
         )
         betas = stagei_out["betas"]
         nn_idx = stagei_out["nn_idx"]
@@ -201,6 +223,7 @@ def fit_smpl_to_markers(
         nn_idx=nn_idx,
         coeffs=coeffs,
         cfg=sii_cfg,
+        marker_weights=weights_t,
     )
 
     return {

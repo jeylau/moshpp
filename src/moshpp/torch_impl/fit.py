@@ -134,6 +134,12 @@ def _seed_root_from_rigid(
     return aa, transl
 
 
+# SMPL local frame: head along +Y. Rotating 180° around local Y flips the
+# body's facing direction front/back without moving the pelvis (which sits on
+# the local Y axis). Compose as `R_new = R @ _R_LOCAL_Y_180` to apply after R.
+_R_LOCAL_Y_180 = torch.tensor([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]])
+
+
 # ---------------------------------------------------------------------------
 # Stage configuration
 # ---------------------------------------------------------------------------
@@ -200,6 +206,11 @@ class StageIICfg:
     # to optimize everything at once; smaller values chunk the sequence.
     batch_size: int = 1
     lbfgs_iters_batched: int = 80
+    # Compose a 180° rotation around the SMPL local Y axis (= body vertical)
+    # onto the rigid-alignment seed. Use when the SVD rigid init lands in the
+    # back-facing basin (mesh visibly walks backwards). Pelvis is on local Y
+    # so this flips facing direction without shifting body position.
+    flip_root_seed_180: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +226,7 @@ def mosh_stagei(
     latent_labels: List[str],
     marker_vids: torch.Tensor,  # (M,) int64, vertex id on canonical body for each latent marker
     cfg: StageICfg,
+    marker_weights: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Jointly estimate betas, latent marker placements, and per-reference-frame pose.
 
@@ -327,7 +339,7 @@ def mosh_stagei(
             verts = body_model(betas_b, body_pose, global_orient, transl)  # (N, V, 3)
             sim_markers = synth_markers(verts, nn_idx, live_coeffs)  # (N, M, 3)
 
-            data_term = _data_residual(sim_markers, stagei_frames)
+            data_term = _data_residual(sim_markers, stagei_frames, marker_weights)
             if cfg.optimize_markers_latent:
                 init_term = ((markers_latent - init_markers) ** 2).sum()
                 # Iso-surface constraint: keep coeffs[:, 1] (normal-direction
@@ -374,7 +386,7 @@ def mosh_stagei(
             betas_b = betas.unsqueeze(0).expand(N, -1)
             verts = body_model(betas_b, body_pose, global_orient, transl)
             sim_markers = synth_markers(verts, nn_idx, live_coeffs)
-            data_se = float(_data_residual(sim_markers, stagei_frames))
+            data_se = float(_data_residual(sim_markers, stagei_frames, marker_weights))
             rmse_mm = (data_se / max(n_obs_total, 1)) ** 0.5 * 1000.0
             betas_norm = float(betas.norm())
             mlat_drift_mm = (
@@ -466,6 +478,7 @@ def mosh_stageii(
     coeffs: torch.Tensor,  # (M, 3) from stage I (or from template if v0)
     cfg: StageIICfg,
     latent_labels: Optional[List[str]] = None,
+    marker_weights: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Pose estimation against observed markers (shape and marker placement frozen).
 
@@ -481,6 +494,7 @@ def mosh_stageii(
             nn_idx=nn_idx,
             coeffs=coeffs,
             cfg=cfg,
+            marker_weights=marker_weights,
         )
     else:
         out = _mosh_stageii_batched(
@@ -491,6 +505,7 @@ def mosh_stageii(
             nn_idx=nn_idx,
             coeffs=coeffs,
             cfg=cfg,
+            marker_weights=marker_weights,
         )
 
     if latent_labels is not None:
@@ -541,6 +556,7 @@ def _mosh_stageii_per_frame(
     nn_idx: torch.Tensor,
     coeffs: torch.Tensor,
     cfg: StageIICfg,
+    marker_weights: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Original per-frame LBFGS. Kept verbatim for parity with prior runs."""
     device = body_model.device
@@ -609,6 +625,8 @@ def _mosh_stageii_per_frame(
                 sim = synth_markers(verts, nn_idx, coeffs).squeeze(0)
                 sim_sub = sim[frame.label_idx]
                 R, tvec = rigid_align(sim_sub, frame.obs_xyz)
+                if cfg.flip_root_seed_180:
+                    R = R @ _R_LOCAL_Y_180.to(R)
                 J_root = body_model.root_joint(betas)
                 aa, transl_smpl = _seed_root_from_rigid(R, tvec, J_root)
                 global_t.copy_(aa)
@@ -628,7 +646,10 @@ def _mosh_stageii_per_frame(
                 )
                 sim = synth_markers(verts, nn_idx, coeffs).squeeze(0)  # (M, 3)
                 sim_sub = sim[frame.label_idx]  # (k, 3)
-                data_term = ((sim_sub - frame.obs_xyz) ** 2).sum()
+                se = ((sim_sub - frame.obs_xyz) ** 2).sum(dim=-1)  # (k,)
+                if marker_weights is not None:
+                    se = se * marker_weights[frame.label_idx]
+                data_term = se.sum()
                 z_term = (z_t**2).sum()
                 loss = cfg.wt_data * data_term + (cfg.wt_z * wt_z_mult) * z_term
                 if z_prev_val is not None and z_prev2_val is not None:
@@ -717,6 +738,7 @@ def _mosh_stageii_batched(
     nn_idx: torch.Tensor,
     coeffs: torch.Tensor,
     cfg: StageIICfg,
+    marker_weights: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Optimize ``cfg.batch_size`` frames jointly per LBFGS call.
 
@@ -756,6 +778,8 @@ def _mosh_stageii_batched(
                 continue
             sim_sub = sim0[frame.label_idx]
             R, tvec = rigid_align(sim_sub, frame.obs_xyz)
+            if cfg.flip_root_seed_180:
+                R = R @ _R_LOCAL_Y_180.to(R)
             aa, transl_smpl = _seed_root_from_rigid(R, tvec, J_root)
             out_global[t] = aa
             out_transl[t] = transl_smpl
@@ -797,7 +821,10 @@ def _mosh_stageii_batched(
             for i, frame in enumerate(chunk_frames):
                 if frame.obs_xyz.shape[0]:
                     sim_sub = sim[i, frame.label_idx]
-                    data_term = data_term + ((sim_sub - frame.obs_xyz) ** 2).sum()
+                    se = ((sim_sub - frame.obs_xyz) ** 2).sum(dim=-1)
+                    if marker_weights is not None:
+                        se = se * marker_weights[frame.label_idx]
+                    data_term = data_term + se.sum()
 
             z_term = (z_chunk**2).sum()
 
@@ -901,15 +928,24 @@ def _log_per_marker_rmse(rows, header: str) -> None:
 
 
 def _data_residual(
-    sim_markers: torch.Tensor, frames: List[FrameMarkers]
+    sim_markers: torch.Tensor,
+    frames: List[FrameMarkers],
+    marker_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Sum-of-squares over the (frame, marker) pairs that are actually observed."""
+    """Sum-of-squares over the (frame, marker) pairs that are actually observed.
+
+    `marker_weights`: optional (M,) tensor multiplying each marker's squared
+    residual. Set to 0.0 to drop a marker entirely; >1.0 to boost.
+    """
     total = sim_markers.new_zeros(())
     for f_idx, frame in enumerate(frames):
         if frame.obs_xyz.shape[0] == 0:
             continue
         sim_sub = sim_markers[f_idx, frame.label_idx]
-        total = total + ((sim_sub - frame.obs_xyz) ** 2).sum()
+        se = ((sim_sub - frame.obs_xyz) ** 2).sum(dim=-1)  # (k,)
+        if marker_weights is not None:
+            se = se * marker_weights[frame.label_idx]
+        total = total + se.sum()
     return total
 
 

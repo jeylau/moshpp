@@ -19,6 +19,7 @@ dependencies = [
     "loguru",
     "omegaconf",
     "ipykernel",
+    "pandas>=3.0.3",
 ]
 
 [project.optional-dependencies]
