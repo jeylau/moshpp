@@ -2,13 +2,14 @@
 
 We expose only what MoSh needs: a forward pass producing posed vertices given
 betas, body_pose (axis-angle, 21 joints = 63 dims), global_orient (3) and
-transl (3). Hands are kept at their flat rest pose; we do not optimize them.
+transl (3). Hand pose is optional: pass `hand_pose` (B, 90) to articulate the
+fingers, or leave it None to keep hands at their flat rest pose.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import smplx
@@ -26,11 +27,20 @@ class SMPLHBodyModel(nn.Module):
         gender: str = "male",
         num_betas: int = 10,
         device: Union[str, torch.device] = "cpu",
+        flat_hand_mean: bool = False,
     ) -> None:
+        """`flat_hand_mean=False` (the default) puts the hand's zero pose at the
+        MANO mean — a natural hand with the fingers together. `True` uses the
+        flat rest pose instead, which splays the fingers ~67mm apart vs ~44mm
+        and makes finger markers systematically wrong. Legacy MoSh++ runs with
+        `use_hands_mean: true` (moshpp_conf.yaml), which corresponds to False
+        here — note the smplx flag is the negation of the legacy one.
+        """
         super().__init__()
         self.device = torch.device(device)
         self.gender = gender
         self.num_betas = num_betas
+        self.flat_hand_mean = flat_hand_mean
 
         # smplx.create wants the directory containing SMPLH_{GENDER}.pkl, OR
         # a direct path. We accept the direct .pkl path and split.
@@ -51,7 +61,7 @@ class SMPLHBodyModel(nn.Module):
             gender=gender,
             num_betas=num_betas,
             use_pca=False,
-            flat_hand_mean=True,
+            flat_hand_mean=flat_hand_mean,
             ext="pkl",
             batch_size=1,
         ).to(self.device)
@@ -72,10 +82,19 @@ class SMPLHBodyModel(nn.Module):
         body_pose: torch.Tensor,  # (B, 63) axis-angle
         global_orient: torch.Tensor,  # (B, 3)
         transl: torch.Tensor,  # (B, 3)
+        hand_pose: Optional[torch.Tensor] = None,  # (B, 90) axis-angle, or None
     ) -> torch.Tensor:
-        """Return posed vertices (B, V, 3)."""
+        """Return posed vertices (B, V, 3).
+
+        `hand_pose` is (B, 90) = left (45) then right (45), axis-angle. When
+        None the hands stay at the flat rest pose. Note that finger markers
+        fitted against frozen hands can only be satisfied by rotating the
+        wrist, which corrupts wrist orientation — either articulate the hands
+        or drop the finger markers from the data term.
+        """
         B = body_pose.shape[0]
-        hand_pose = self._zero_hand_pose(B)
+        if hand_pose is None:
+            hand_pose = self._zero_hand_pose(B)
         # smplx SMPLH expects left_hand_pose and right_hand_pose separately when use_pca=False
         out = self.smpl(
             betas=betas,
@@ -93,16 +112,27 @@ class SMPLHBodyModel(nn.Module):
         """T-pose vertices with zero betas."""
         return self.v_template.clone()
 
-    def canonical_verts(self, betas: torch.Tensor) -> torch.Tensor:
-        """T-pose vertices with the given betas. Differentiable w.r.t. betas."""
+    def canonical_verts(
+        self, betas: torch.Tensor, hand_pose: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """T-pose vertices with the given betas. Differentiable w.r.t. betas.
+
+        `hand_pose` is (90,) or (1, 90). Pass the same static hand pose used for
+        posing so that finger markers are placed on a hand in the configuration
+        they will actually be synthesized from.
+        """
         betas_b = betas.view(1, -1)
         zero3 = torch.zeros(1, 3, device=self.device)
+        if hand_pose is None:
+            hand_pose = self._zero_hand_pose(1)
+        else:
+            hand_pose = hand_pose.reshape(1, 90)
         out = self.smpl(
             betas=betas_b,
             global_orient=zero3,
             body_pose=torch.zeros(1, self.BODY_POSE_DIM, device=self.device),
-            left_hand_pose=torch.zeros(1, 45, device=self.device),
-            right_hand_pose=torch.zeros(1, 45, device=self.device),
+            left_hand_pose=hand_pose[:, :45],
+            right_hand_pose=hand_pose[:, 45:],
             transl=zero3,
             return_verts=True,
         )

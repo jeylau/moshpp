@@ -70,6 +70,7 @@ def fit_smpl_to_markers(
     stageii_cfg: Optional[StageIICfg] = None,
     stageii_batch_size: Optional[int] = None,
     marker_weights: Optional[Dict[str, float]] = None,
+    flat_hand_mean: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Fit SMPL-H to a sequence of labeled 3D markers.
 
@@ -82,6 +83,11 @@ def fit_smpl_to_markers(
     1.0 in the data residual. Set to 0.0 to drop a marker entirely (useful for
     a single bad marker in a single trial). Set >1.0 to boost an anatomically
     critical marker (e.g. ``{"Sacral": 10.0}`` when PSIS are missing).
+
+    ``flat_hand_mean=False`` (default) puts the hand's zero pose at the MANO
+    mean (fingers together), matching legacy's ``use_hands_mean: true``. Stage I
+    then fits a static per-subject hand pose on top of that, which is what makes
+    finger markers informative about wrist flexion/extension.
     """
     assert markers.ndim == 3 and markers.shape[2] == 3, "markers must be (T, M, 3)"
     assert markers.shape[1] == len(labels), (
@@ -105,6 +111,15 @@ def fit_smpl_to_markers(
     kept = [(i, label) for i, label in enumerate(labels) if label in marker_vids]
     if not kept:
         raise ValueError("No labels matched marker_vids.")
+    dropped = [label for label in labels if label not in marker_vids]
+    if dropped:
+        # Worth shouting about: a label silently vanishing here removes it from
+        # the data term, and dropping one side of a left/right pair biases the
+        # fit asymmetrically.
+        logger.warning(
+            f"{len(dropped)} label(s) have no vertex id in marker_vids and will "
+            f"be excluded from the fit: {dropped}"
+        )
     latent_labels = [label for _, label in kept]
     marker_vids_t = torch.as_tensor(
         [marker_vids[label] for label in latent_labels], dtype=torch.long, device=dev
@@ -128,7 +143,11 @@ def fit_smpl_to_markers(
 
     # Body model + VPoser
     body_model = SMPLHBodyModel(
-        smplh_path, gender=gender, num_betas=num_betas, device=dev
+        smplh_path,
+        gender=gender,
+        num_betas=num_betas,
+        device=dev,
+        flat_hand_mean=flat_hand_mean,
     )
     vposer = FrozenVPoser(vposer_dir, device=dev)
 
@@ -157,17 +176,20 @@ def fit_smpl_to_markers(
         nn_idx, coeffs = build_local_frame(can_verts, init_markers)
         betas = betas_t.detach()
         markers_latent = init_markers
+        hand_pose = torch.zeros(90, device=dev)
         stagei_out = {
             "betas": betas,
             "markers_latent": markers_latent,
             "nn_idx": nn_idx,
             "coeffs": coeffs,
             "latent_labels": latent_labels,
+            "hand_pose": hand_pose,
         }
     elif run_stage_i:
         if stagei_frame_ids is None:
             stagei_frame_ids = (
-                np.linspace(0, markers.shape[0] - 1, num=stagei_num_frames)
+                np
+                .linspace(0, markers.shape[0] - 1, num=stagei_num_frames)
                 .astype(int)
                 .tolist()
             )
@@ -189,6 +211,7 @@ def fit_smpl_to_markers(
         nn_idx = stagei_out["nn_idx"]
         coeffs = stagei_out["coeffs"]
         markers_latent = stagei_out["markers_latent"]
+        hand_pose = stagei_out["hand_pose"]
     else:
         # v0: zero betas, marker positions = template_vertex + normal * d
         logger.info("skipping stage I — using zero betas and template marker positions")
@@ -201,12 +224,14 @@ def fit_smpl_to_markers(
         nn_idx, coeffs = build_local_frame(v_template, init_markers)
         betas = torch.zeros(num_betas, device=dev)
         markers_latent = init_markers
+        hand_pose = torch.zeros(90, device=dev)
         stagei_out = {
             "betas": betas,
             "markers_latent": markers_latent,
             "nn_idx": nn_idx,
             "coeffs": coeffs,
             "latent_labels": latent_labels,
+            "hand_pose": hand_pose,
         }
 
     # ----- Stage II -----
@@ -224,6 +249,7 @@ def fit_smpl_to_markers(
         coeffs=coeffs,
         cfg=sii_cfg,
         marker_weights=weights_t,
+        hand_pose=hand_pose,
     )
 
     return {
