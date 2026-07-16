@@ -70,7 +70,7 @@ def fit_smpl_to_markers(
     stageii_cfg: Optional[StageIICfg] = None,
     stageii_batch_size: Optional[int] = None,
     marker_weights: Optional[Dict[str, float]] = None,
-    flat_hand_mean: bool = False,
+    flat_hand_mean: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Fit SMPL-H to a sequence of labeled 3D markers.
 
@@ -84,9 +84,12 @@ def fit_smpl_to_markers(
     a single bad marker in a single trial). Set >1.0 to boost an anatomically
     critical marker (e.g. ``{"Sacral": 10.0}`` when PSIS are missing).
 
-    ``flat_hand_mean=False`` (default) puts the hand's zero pose at the MANO
-    mean (fingers together), matching legacy's ``use_hands_mean: true``. Stage I
-    then fits a static per-subject hand pose on top of that, which is what makes
+    ``flat_hand_mean=True`` (default) gives a straight hand; the MANO mean
+    (``False``, legacy's ``use_hands_mean: true``) bakes in ~3.3 rad of curl and
+    renders visibly half-closed. Most hand DoF are unobservable from finger
+    markers, so pair this with ``StageICfg.hand_pose_mean`` (see
+    ``flat_fingers_together_hand``) to say what those DoF should look like.
+    Stage I then fits a static per-subject hand on top, which is what makes
     finger markers informative about wrist flexion/extension.
     """
     assert markers.ndim == 3 and markers.shape[2] == 3, "markers must be (T, M, 3)"

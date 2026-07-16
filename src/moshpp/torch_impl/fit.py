@@ -16,6 +16,7 @@ from moshpp.torch_impl.markers import (
     build_local_frame,
     compute_coeffs,
     compute_nn_idx,
+    remap_nn_idx,
     synth_markers,
 )
 from moshpp.torch_impl.vposer_prior import FrozenVPoser
@@ -221,6 +222,12 @@ class StageICfg:
     # the same step. The hand needs the body settled but not the markers, so it
     # gets its own (earlier) schedule.
     hand_pose_free_from_step: int = 1
+    # Target the hand-pose prior pulls toward, as a (90,) offset from the body
+    # model's own hand zero. Defaults to that zero. With `flat_hand_mean=True`
+    # the zero is a straight but splayed hand; pass
+    # `flat_fingers_together_hand()` to target a straight hand held together,
+    # which is what the unobservable ~30 DoF will then render as.
+    hand_pose_mean: Optional[torch.Tensor] = None
     # Per-marker multiplier on the init + surf terms, keyed by label. Values
     # below 1.0 let a marker relocate further from its seed vertex.
     #
@@ -346,8 +353,14 @@ def mosh_stagei(
     global_orient = nn.Parameter(torch.zeros(N, 3, device=device))
     transl = nn.Parameter(torch.zeros(N, 3, device=device))
     # One static hand pose shared by every reference frame, as an offset from
-    # the model's hand mean (zero == the mean hand).
-    hand_pose = nn.Parameter(torch.zeros(90, device=device))
+    # the body model's hand zero. Starts at `hand_pose_mean` (the prior's
+    # target) rather than at the model zero.
+    hand_mean = (
+        torch.zeros(90, device=device)
+        if cfg.hand_pose_mean is None
+        else cfg.hand_pose_mean.to(device).reshape(90).detach()
+    )
+    hand_pose = nn.Parameter(hand_mean.clone())
 
     # (M, 1) per-marker multiplier on the init/surf terms.
     init_scale = torch.ones(M, device=device)
@@ -471,7 +484,10 @@ def mosh_stagei(
                 if cfg.optimize_betas
                 else torch.tensor(0.0, device=device)
             )
-            handH_term = (hand_pose**2).sum()
+            # Pull toward `hand_pose_mean`, not toward zero. ~30 of a hand's 45
+            # DoF are unobservable from a typical finger-marker set, so whatever
+            # this term targets is what those DoF render as.
+            handH_term = ((hand_pose - hand_mean) ** 2).sum()
 
             loss = (
                 wt_data * data_term
@@ -585,7 +601,8 @@ def mosh_stagei(
     )
 
     logger.info(
-        f"stage I static hand pose: |offset from hand mean| = {float(hand_pose.norm()):.3f} rad"
+        f"stage I static hand pose: |offset from prior target| = "
+        f"{float((hand_pose - hand_mean).norm()):.3f} rad"
     )
 
     return {
@@ -680,20 +697,21 @@ def _report_stageii_per_marker(
     """Recompute simulated markers for every frame and log the per-marker RMSE table."""
     device = body_model.device
     T = stageii_out["body_pose"].shape[0]
-    betas_b = betas.unsqueeze(0).expand(T, -1)
     chunk = 64
     sim_chunks = []
+    subset_vids, nn_idx_local = remap_nn_idx(nn_idx)
+    subset = body_model.make_vertex_subset(subset_vids, betas)
     with torch.no_grad():
         for s in range(0, T, chunk):
             e = min(s + chunk, T)
-            v = body_model(
-                betas_b[s:e],
+            v = body_model.forward_subset(
+                subset,
                 stageii_out["body_pose"][s:e],
                 stageii_out["global_orient"][s:e],
                 stageii_out["transl"][s:e],
                 None if hand_pose is None else hand_pose.unsqueeze(0).expand(e - s, -1),
             )
-            sim_chunks.append(synth_markers(v, nn_idx, coeffs))
+            sim_chunks.append(synth_markers(v, nn_idx_local, coeffs))
         sim_all = torch.cat(sim_chunks, dim=0)
     _log_per_marker_rmse(
         _per_marker_rmse_table(sim_all, observed_frames, latent_labels, marker_weights),
@@ -724,6 +742,13 @@ def _mosh_stageii_per_frame(
     out_loss = torch.zeros(T, device=device)
     pose_mask = _body_pose_mask(cfg.optimize_toes, device)
     hand_b1 = None if hand_pose is None else hand_pose.reshape(1, 90)
+
+    # See the batched path: skin only the vertices the markers read.
+    subset_vids, nn_idx_local = remap_nn_idx(nn_idx)
+    subset = body_model.make_vertex_subset(subset_vids, betas)
+    logger.info(
+        f"  masked LBS: skinning {len(subset_vids)} of {body_model.num_verts} vertices"
+    )
 
     # Per-frame state
     pose_prev = None
@@ -771,14 +796,14 @@ def _mosh_stageii_per_frame(
                 betas_b = betas.unsqueeze(0)
                 # Use a zero-transl forward to recover where the body actually sits
                 # under the current (R=I, t=0) so the rigid alignment is correct.
-                verts = body_model(
-                    betas_b,
+                verts = body_model.forward_subset(
+                    subset,
                     (pose_t * pose_mask).unsqueeze(0),
                     torch.zeros(1, 3, device=device),
                     torch.zeros(1, 3, device=device),
                     hand_b1,
                 )
-                sim = synth_markers(verts, nn_idx, coeffs).squeeze(0)
+                sim = synth_markers(verts, nn_idx_local, coeffs).squeeze(0)
                 sim_sub = sim[frame.label_idx]
                 R, tvec = rigid_align(sim_sub, frame.obs_xyz)
                 if cfg.flip_root_seed_180:
@@ -797,14 +822,15 @@ def _mosh_stageii_per_frame(
                 opt.zero_grad()
                 pose_eff = (pose_t * pose_mask).unsqueeze(0)  # (1, 63)
                 betas_b = betas.unsqueeze(0)
-                verts = body_model(
-                    betas_b,
+                verts = body_model.forward_subset(
+                    subset,
                     pose_eff,
                     global_t.unsqueeze(0),
                     transl_t.unsqueeze(0),
                     hand_b1,
+                    betas=betas,
                 )
-                sim = synth_markers(verts, nn_idx, coeffs).squeeze(0)  # (M, 3)
+                sim = synth_markers(verts, nn_idx_local, coeffs).squeeze(0)  # (M, 3)
                 sim_sub = sim[frame.label_idx]  # (k, 3)
                 se = ((sim_sub - frame.obs_xyz) ** 2).sum(dim=-1)  # (k,)
                 if marker_weights is not None:
@@ -856,14 +882,14 @@ def _mosh_stageii_per_frame(
             pose_eff_f = (pose_t.detach() * pose_mask).unsqueeze(0)
             out_body[t] = pose_eff_f.squeeze(0)
             # Report per-marker RMSE in mm — the loss number alone is hard to read.
-            verts_f = body_model(
-                betas.unsqueeze(0),
+            verts_f = body_model.forward_subset(
+                subset,
                 pose_eff_f,
                 global_t.detach().unsqueeze(0),
                 transl_t.detach().unsqueeze(0),
                 hand_b1,
             )
-            sim_f = synth_markers(verts_f, nn_idx, coeffs).squeeze(0)
+            sim_f = synth_markers(verts_f, nn_idx_local, coeffs).squeeze(0)
             sim_sub_f = sim_f[frame.label_idx]
             rmse_mm = float(((sim_sub_f - frame.obs_xyz) ** 2).mean().sqrt()) * 1000.0
 
@@ -918,6 +944,15 @@ def _mosh_stageii_batched(
     out_body = torch.zeros(T, 63, device=device)
     out_loss = torch.zeros(T, device=device)
     pose_mask = _body_pose_mask(cfg.optimize_toes, device)
+
+    # Stage II holds shape and marker layout fixed, so only the ~150 vertices the
+    # markers read ever matter. Skin just those instead of all 6890 (see
+    # SMPLHBodyModel.make_vertex_subset). Valid only because betas is frozen here.
+    subset_vids, nn_idx_local = remap_nn_idx(nn_idx)
+    subset = body_model.make_vertex_subset(subset_vids, betas)
+    logger.info(
+        f"  masked LBS: skinning {len(subset_vids)} of {body_model.num_verts} vertices"
+    )
 
     # Phase 1: rigid-align every frame independently from the rest body.
     # This gives each frame a sensible global_orient/transl before LBFGS.
@@ -983,10 +1018,10 @@ def _mosh_stageii_batched(
         def closure():
             optimizer.zero_grad()
             pose_eff = pose_chunk * pose_mask  # (chunk_T, 63)
-            verts = body_model(
-                betas_b, pose_eff, global_chunk, transl_chunk, hand_bc
-            )  # (chunk_T, V, 3)
-            sim = synth_markers(verts, nn_idx, coeffs)  # (chunk_T, M, 3)
+            verts = body_model.forward_subset(
+                subset, pose_eff, global_chunk, transl_chunk, hand_bc, betas=betas
+            )  # (chunk_T, S, 3)
+            sim = synth_markers(verts, nn_idx_local, coeffs)  # (chunk_T, M, 3)
 
             data_term = sim.new_zeros(())
             for i, frame in enumerate(chunk_frames):
@@ -1030,14 +1065,14 @@ def _mosh_stageii_batched(
             out_body[chunk_start:chunk_end] = body_pose
 
             # Per-frame loss + chunk RMSE for logging
-            verts_final = body_model(
-                betas_b,
+            verts_final = body_model.forward_subset(
+                subset,
                 body_pose,
                 global_chunk.detach(),
                 transl_chunk.detach(),
                 hand_bc,
             )
-            sim_final = synth_markers(verts_final, nn_idx, coeffs)
+            sim_final = synth_markers(verts_final, nn_idx_local, coeffs)
             total_se = 0.0
             total_n = 0
             for i, frame in enumerate(chunk_frames):

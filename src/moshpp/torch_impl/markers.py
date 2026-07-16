@@ -72,6 +72,18 @@ def build_local_frame(
     return nn_idx, coeffs
 
 
+def remap_nn_idx(nn_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compact `nn_idx` onto the unique vertices it references.
+
+    Returns `(vertex_ids, nn_idx_local)` where `vertex_ids` are the distinct
+    vertices in `nn_idx` (sorted) and `nn_idx_local` indexes into them. Feed
+    `vertex_ids` to `SMPLHBodyModel.make_vertex_subset` and `nn_idx_local` to
+    `synth_markers` alongside the subset's posed vertices.
+    """
+    vertex_ids, inverse = torch.unique(nn_idx.reshape(-1), return_inverse=True)
+    return vertex_ids, inverse.reshape(nn_idx.shape)
+
+
 def synth_markers(
     verts: torch.Tensor,  # (B, V, 3)
     nn_idx: torch.Tensor,  # (M, 3)
