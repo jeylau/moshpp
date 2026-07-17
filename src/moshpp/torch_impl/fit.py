@@ -213,8 +213,9 @@ class StageICfg:
     # of finger markers, so we fit a single static one — appropriate whenever
     # the subject holds a roughly fixed hand shape.
     optimize_hand_pose: bool = True
-    # L2 on the hand-pose offset, keeping it near the model's hand mean.
-    # Legacy stagei_wt_poseH = 3.0 (moshpp_conf.yaml opt_weights.smplh).
+    # L2 on the hand-pose offset, keeping it near the model's hand mean. In MANO
+    # PCA space this is legacy's poseH term, which regularizes the same
+    # coefficients. Legacy stagei_wt_poseH = 3.0 (moshpp_conf.yaml).
     wt_poseH: float = 3.0
     # Anneal step from which the hand pose is free. Kept separate from
     # `markers_latent_free_from_step`: tying the two gives the hand only the
@@ -222,14 +223,11 @@ class StageICfg:
     # the same step. The hand needs the body settled but not the markers, so it
     # gets its own (earlier) schedule.
     hand_pose_free_from_step: int = 1
-    # Target the hand-pose prior pulls toward, as a (90,) offset from the body
-    # model's own hand zero. Defaults to that zero, which under
-    # `flat_hand_mean=True` is a straight hand with the fingers a natural ~35mm
-    # apart — a good target, since most hand DoF are unobservable from finger
-    # markers and render as whatever this pulls toward. Only override with a
-    # pose you have actually looked at: targets that merely match a summary
-    # statistic (e.g. mean finger spread) can satisfy it by curling the fingers
-    # through each other.
+    # Target the hand-pose prior pulls toward, in the body model's hand space
+    # (2*dof_per_hand). Defaults to that space's zero — the MANO mean hand, which
+    # is the natural centre for the PCA basis. Only override with a pose you have
+    # actually looked at: a target that merely matches a summary statistic (e.g.
+    # mean finger spread) can satisfy it by curling the fingers through each other.
     hand_pose_mean: Optional[torch.Tensor] = None
     # Per-marker multiplier on the init + surf terms, keyed by label. Values
     # below 1.0 let a marker relocate further from its seed vertex.
@@ -358,10 +356,11 @@ def mosh_stagei(
     # One static hand pose shared by every reference frame, as an offset from
     # the body model's hand zero. Starts at `hand_pose_mean` (the prior's
     # target) rather than at the model zero.
+    hand_dim = body_model.hand_pose_dim
     hand_mean = (
-        torch.zeros(90, device=device)
+        torch.zeros(hand_dim, device=device)
         if cfg.hand_pose_mean is None
-        else cfg.hand_pose_mean.to(device).reshape(90).detach()
+        else cfg.hand_pose_mean.to(device).reshape(hand_dim).detach()
     )
     hand_pose = nn.Parameter(hand_mean.clone())
 
@@ -455,7 +454,7 @@ def mosh_stagei(
                 live_coeffs = compute_coeffs(can_verts, live_markers, nn_idx)
             pose_eff = body_pose * pose_mask  # (N, 63)
             betas_b = betas.unsqueeze(0).expand(N, -1)  # (N, num_betas)
-            hand_b = hand_pose.unsqueeze(0).expand(N, -1)  # (N, 90)
+            hand_b = hand_pose.unsqueeze(0).expand(N, -1)  # (N, 2*dof_per_hand)
             verts = body_model(
                 betas_b, pose_eff, global_orient, transl, hand_b
             )  # (N, V, 3)
@@ -634,7 +633,7 @@ def mosh_stageii(
     cfg: StageIICfg,
     latent_labels: Optional[List[str]] = None,
     marker_weights: Optional[torch.Tensor] = None,
-    hand_pose: Optional[torch.Tensor] = None,  # (90,) static, from stage I
+    hand_pose: Optional[torch.Tensor] = None,  # (2*dof_per_hand,), from stage I
 ) -> Dict[str, torch.Tensor]:
     """Pose estimation against observed markers (shape and marker placement frozen).
 
@@ -744,7 +743,7 @@ def _mosh_stageii_per_frame(
     out_transl = torch.zeros(T, 3, device=device)
     out_loss = torch.zeros(T, device=device)
     pose_mask = _body_pose_mask(cfg.optimize_toes, device)
-    hand_b1 = None if hand_pose is None else hand_pose.reshape(1, 90)
+    hand_b1 = None if hand_pose is None else hand_pose.reshape(1, -1)
 
     # See the batched path: skin only the vertices the markers read.
     subset_vids, nn_idx_local = remap_nn_idx(nn_idx)
@@ -967,7 +966,7 @@ def _mosh_stageii_batched(
             body_pose0,
             torch.zeros(1, 3, device=device),
             torch.zeros(1, 3, device=device),
-            None if hand_pose is None else hand_pose.reshape(1, 90),
+            None if hand_pose is None else hand_pose.reshape(1, -1),
         )
         sim0 = synth_markers(verts0, nn_idx, coeffs).squeeze(0)  # (M, 3)
         for t, frame in enumerate(observed_frames):
@@ -1006,7 +1005,7 @@ def _mosh_stageii_batched(
 
         betas_b = betas.unsqueeze(0).expand(chunk_T, -1)
         hand_bc = (
-            None if hand_pose is None else hand_pose.reshape(1, 90).expand(chunk_T, -1)
+            None if hand_pose is None else hand_pose.reshape(1, -1).expand(chunk_T, -1)
         )
 
         optimizer = torch.optim.LBFGS(

@@ -2,8 +2,9 @@
 
 We expose only what MoSh needs: a forward pass producing posed vertices given
 betas, body_pose (axis-angle, 21 joints = 63 dims), global_orient (3) and
-transl (3). Hand pose is optional: pass `hand_pose` (B, 90) to articulate the
-fingers, or leave it None to keep hands at their flat rest pose.
+transl (3). Hand pose is optional: pass `hand_pose` (B, 2*dof_per_hand) to
+articulate the fingers, or leave it None to keep them at their rest pose.
+Hands live in MANO's PCA space by default, as in legacy MoSh++.
 """
 
 from __future__ import annotations
@@ -77,29 +78,40 @@ class SMPLHBodyModel(nn.Module):
         gender: str = "male",
         num_betas: int = 10,
         device: Union[str, torch.device] = "cpu",
-        flat_hand_mean: bool = True,
+        flat_hand_mean: bool = False,
+        dof_per_hand: int = 24,
     ) -> None:
-        """Neither hand preset is a straight hand with the fingers together.
+        """Hands are parameterized in MANO's PCA space, as in legacy MoSh++.
 
-        `flat_hand_mean=True` (the default here) gives a straight hand, but with
-        the fingers splayed ~67mm apart. `False` uses the MANO mean, which bakes
-        in ~3.29 rad of curl (up to 1.28 rad on one joint) and renders a visibly
-        half-closed hand, though its fingers sit ~44mm apart. Legacy MoSh++ runs
-        `use_hands_mean: true` (= `flat_hand_mean=False` here; the smplx flag is
-        the negation of the legacy one).
+        `dof_per_hand` keeps the top-N MANO components per hand (legacy
+        `dof_per_hand: 24`, moshpp_conf.yaml); pass 45 for the raw axis-angle
+        space. The PCA basis is what makes hands identifiable from a handful of
+        finger markers: 5 markers give 15 scalar observations, so raw 45-d leaves
+        30 directions (67% of the space) determined by nothing but the prior,
+        whereas at 12 components the markers pin every direction. It is a
+        conditioning fix, not a plausibility guarantee — a large enough
+        coefficient still leaves the anatomical region in any of these spaces.
 
-        Only ~15 of a hand's 45 DoF are observable from a typical finger-marker
-        set, so the unobserved 30 are decided by whatever the pose prior pulls
-        toward — which is why the preset visibly dictates the rendered hand.
-        The straight preset is the safer target: its fingers sit ~35mm apart,
-        close to a real relaxed hand, and it cannot curl the fingers into each
-        other. Its extra splay costs nothing measurable in marker error.
+        `flat_hand_mean=False` (default) matches legacy's `use_hands_mean: true`
+        — note the smplx flag is the negation of the legacy one.
+
+        It only moves the origin of the hand space; the PCA basis is identical
+        either way, so it trades off against nothing but the rest pose. `False`
+        centers on the MANO mean, which bakes in ~3.3 rad of curl: with a sparse
+        finger-marker set most hand directions are unobserved, the fit cannot
+        undo the curl, and hands render visibly half-closed. `True` centers on a
+        straight hand instead — usually the better *look*, at no measured cost to
+        marker accuracy — but it is a divergence from legacy, so it is opt-in.
         """
         super().__init__()
         self.device = torch.device(device)
         self.gender = gender
         self.num_betas = num_betas
         self.flat_hand_mean = flat_hand_mean
+        self.dof_per_hand = dof_per_hand
+        self.use_pca = dof_per_hand < 45
+        # Dim of the per-hand pose vector this model accepts (both hands: x2).
+        self.hand_pose_dim = 2 * dof_per_hand
 
         # smplx.create wants the directory containing SMPLH_{GENDER}.pkl, OR
         # a direct path. We accept the direct .pkl path and split.
@@ -119,7 +131,8 @@ class SMPLHBodyModel(nn.Module):
             model_type="smplh",
             gender=gender,
             num_betas=num_betas,
-            use_pca=False,
+            use_pca=self.use_pca,
+            num_pca_comps=dof_per_hand,
             flat_hand_mean=flat_hand_mean,
             ext="pkl",
             batch_size=1,
@@ -132,8 +145,30 @@ class SMPLHBodyModel(nn.Module):
         self.num_verts = int(self.v_template.shape[0])
 
     def _zero_hand_pose(self, batch_size: int) -> torch.Tensor:
-        # 15 joints per hand * 3 = 45 dims each, total 90
-        return torch.zeros(batch_size, 90, device=self.device, dtype=torch.float32)
+        """Rest hand in whatever space this model uses: `2 * dof_per_hand`."""
+        return torch.zeros(
+            batch_size, self.hand_pose_dim, device=self.device, dtype=torch.float32
+        )
+
+    def hand_pose_to_aa(self, hand_pose: torch.Tensor) -> torch.Tensor:
+        """(B, 2*dof_per_hand) in this model's hand space -> (B, 90) axis-angle.
+
+        Mirrors what `smplx`'s own forward does internally, which our masked LBS
+        path bypasses: PCA coefficients must be expanded through the components
+        and offset by the hand mean before they can go through Rodrigues.
+        """
+        smpl = self.smpl
+        left, right = (
+            hand_pose[:, : self.dof_per_hand],
+            hand_pose[:, self.dof_per_hand :],
+        )
+        if self.use_pca:
+            left = torch.einsum("bi,ij->bj", left, smpl.left_hand_components)
+            right = torch.einsum("bi,ij->bj", right, smpl.right_hand_components)
+        aa = torch.cat([left, right], dim=1)
+        # pose_mean holds the hand mean in its last 90 entries (zero when
+        # flat_hand_mean=True). smplx adds it after the PCA expansion.
+        return aa + smpl.pose_mean[-90:].unsqueeze(0)
 
     def make_vertex_subset(
         self, vertex_ids: torch.Tensor, betas: Optional[torch.Tensor] = None
@@ -174,7 +209,11 @@ class SMPLHBodyModel(nn.Module):
                 )
         if hand_pose is None:
             hand_pose = self._zero_hand_pose(B)
-        pose = torch.cat([global_orient, body_pose, hand_pose], dim=1)  # (B, 156)
+        # smplx's forward expands PCA coeffs and adds pose_mean internally; this
+        # path builds the axis-angle vector itself, so it must do the same.
+        # pose_mean is zero over root+body, so only the hands need it.
+        hand_aa = self.hand_pose_to_aa(hand_pose)  # (B, 90)
+        pose = torch.cat([global_orient, body_pose, hand_aa], dim=1)  # (B, 156)
 
         rot_mats = batch_rodrigues(pose.reshape(-1, 3)).view([B, -1, 3, 3])
 
@@ -211,26 +250,28 @@ class SMPLHBodyModel(nn.Module):
         body_pose: torch.Tensor,  # (B, 63) axis-angle
         global_orient: torch.Tensor,  # (B, 3)
         transl: torch.Tensor,  # (B, 3)
-        hand_pose: Optional[torch.Tensor] = None,  # (B, 90) axis-angle, or None
+        hand_pose: Optional[torch.Tensor] = None,  # (B, 2*dof_per_hand), or None
     ) -> torch.Tensor:
         """Return posed vertices (B, V, 3).
 
-        `hand_pose` is (B, 90) = left (45) then right (45), axis-angle. When
-        None the hands stay at the flat rest pose. Note that finger markers
-        fitted against frozen hands can only be satisfied by rotating the
-        wrist, which corrupts wrist orientation — either articulate the hands
-        or drop the finger markers from the data term.
+        `hand_pose` is (B, 2*dof_per_hand) = left then right, in this model's
+        hand space (MANO PCA coefficients unless dof_per_hand=45). When None the
+        hands stay at their rest pose. Note that finger markers fitted against
+        frozen hands can only be satisfied by rotating the wrist, which corrupts
+        wrist orientation — either articulate the hands or drop the finger
+        markers from the data term.
         """
         B = body_pose.shape[0]
         if hand_pose is None:
             hand_pose = self._zero_hand_pose(B)
         # smplx SMPLH expects left_hand_pose and right_hand_pose separately when use_pca=False
+        d = self.dof_per_hand
         out = self.smpl(
             betas=betas,
             global_orient=global_orient,
             body_pose=body_pose,
-            left_hand_pose=hand_pose[:, :45],
-            right_hand_pose=hand_pose[:, 45:],
+            left_hand_pose=hand_pose[:, :d],
+            right_hand_pose=hand_pose[:, d:],
             transl=transl,
             return_verts=True,
         )
@@ -246,22 +287,22 @@ class SMPLHBodyModel(nn.Module):
     ) -> torch.Tensor:
         """T-pose vertices with the given betas. Differentiable w.r.t. betas.
 
-        `hand_pose` is (90,) or (1, 90). Pass the same static hand pose used for
-        posing so that finger markers are placed on a hand in the configuration
-        they will actually be synthesized from.
+        `hand_pose` is (2*dof_per_hand,) or (1, 2*dof_per_hand). Pass the same
+        static hand pose used for posing so that finger markers are placed on a
+        hand in the configuration they will actually be synthesized from.
         """
         betas_b = betas.view(1, -1)
         zero3 = torch.zeros(1, 3, device=self.device)
         if hand_pose is None:
             hand_pose = self._zero_hand_pose(1)
         else:
-            hand_pose = hand_pose.reshape(1, 90)
+            hand_pose = hand_pose.reshape(1, self.hand_pose_dim)
         out = self.smpl(
             betas=betas_b,
             global_orient=zero3,
             body_pose=torch.zeros(1, self.BODY_POSE_DIM, device=self.device),
-            left_hand_pose=hand_pose[:, :45],
-            right_hand_pose=hand_pose[:, 45:],
+            left_hand_pose=hand_pose[:, : self.dof_per_hand],
+            right_hand_pose=hand_pose[:, self.dof_per_hand :],
             transl=zero3,
             return_verts=True,
         )
@@ -277,8 +318,8 @@ class SMPLHBodyModel(nn.Module):
             betas=betas,
             global_orient=zero3,
             body_pose=torch.zeros(1, self.BODY_POSE_DIM, device=self.device),
-            left_hand_pose=torch.zeros(1, 45, device=self.device),
-            right_hand_pose=torch.zeros(1, 45, device=self.device),
+            left_hand_pose=torch.zeros(1, self.dof_per_hand, device=self.device),
+            right_hand_pose=torch.zeros(1, self.dof_per_hand, device=self.device),
             transl=zero3,
             return_verts=False,
         )

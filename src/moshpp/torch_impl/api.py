@@ -70,7 +70,8 @@ def fit_smpl_to_markers(
     stageii_cfg: Optional[StageIICfg] = None,
     stageii_batch_size: Optional[int] = None,
     marker_weights: Optional[Dict[str, float]] = None,
-    flat_hand_mean: bool = True,
+    flat_hand_mean: bool = False,
+    dof_per_hand: int = 24,
 ) -> Dict[str, torch.Tensor]:
     """Fit SMPL-H to a sequence of labeled 3D markers.
 
@@ -84,10 +85,16 @@ def fit_smpl_to_markers(
     a single bad marker in a single trial). Set >1.0 to boost an anatomically
     critical marker (e.g. ``{"Sacral": 10.0}`` when PSIS are missing).
 
-    ``flat_hand_mean=True`` (default) gives a straight hand; the MANO mean
-    (``False``, legacy's ``use_hands_mean: true``) bakes in ~3.3 rad of curl and
-    renders visibly half-closed. Stage I fits a static per-subject hand on top,
-    which is what makes finger markers informative about wrist flexion/extension.
+    Hands are parameterized in MANO PCA space with ``dof_per_hand`` components,
+    matching legacy MoSh++ (``dof_per_hand: 24``); pass 45 for raw axis-angle.
+    Stage I fits a static per-subject hand in that space, which is what makes
+    finger markers informative about wrist flexion/extension.
+
+    ``flat_hand_mean=False`` (default) is legacy's ``use_hands_mean: true`` and
+    centers the hand space on the MANO mean, which renders visibly curled. Pass
+    ``True`` to center on a straight hand instead. This affects neither the PCA
+    basis nor fit accuracy — only which hand the unobserved directions relax
+    toward — but it is a divergence from legacy, hence off by default.
     """
     assert markers.ndim == 3 and markers.shape[2] == 3, "markers must be (T, M, 3)"
     assert markers.shape[1] == len(labels), (
@@ -148,6 +155,7 @@ def fit_smpl_to_markers(
         num_betas=num_betas,
         device=dev,
         flat_hand_mean=flat_hand_mean,
+        dof_per_hand=dof_per_hand,
     )
     vposer = FrozenVPoser(vposer_dir, device=dev)
 
@@ -176,7 +184,7 @@ def fit_smpl_to_markers(
         nn_idx, coeffs = build_local_frame(can_verts, init_markers)
         betas = betas_t.detach()
         markers_latent = init_markers
-        hand_pose = torch.zeros(90, device=dev)
+        hand_pose = torch.zeros(body_model.hand_pose_dim, device=dev)
         stagei_out = {
             "betas": betas,
             "markers_latent": markers_latent,
@@ -224,7 +232,7 @@ def fit_smpl_to_markers(
         nn_idx, coeffs = build_local_frame(v_template, init_markers)
         betas = torch.zeros(num_betas, device=dev)
         markers_latent = init_markers
-        hand_pose = torch.zeros(90, device=dev)
+        hand_pose = torch.zeros(body_model.hand_pose_dim, device=dev)
         stagei_out = {
             "betas": betas,
             "markers_latent": markers_latent,
@@ -252,11 +260,22 @@ def fit_smpl_to_markers(
         hand_pose=hand_pose,
     )
 
+    # `stagei["hand_pose"]` is in the model's hand space (PCA coefficients by
+    # default). Also return it as raw axis-angle with the hand mean folded in:
+    # that is what viewers and other SMPL-H consumers expect, and it does not
+    # depend on `dof_per_hand`. Apply it with flat_hand_mean=True, since the mean
+    # is already included.
+    with torch.no_grad():
+        hand_pose_aa = body_model.hand_pose_to_aa(
+            stagei_out["hand_pose"].reshape(1, -1)
+        ).reshape(-1)
+
     return {
         "latent_labels": latent_labels,
         "marker_vids": marker_vids_t,
         "stagei": stagei_out,
         "stageii": stageii_out,
+        "hand_pose_aa": hand_pose_aa,
         "faces": body_model.faces,
         "gender": gender,
     }
