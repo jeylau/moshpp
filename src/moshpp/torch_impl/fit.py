@@ -152,6 +152,32 @@ _R_LOCAL_Y_180 = torch.tensor([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.
 # root-inclusive vector).
 _TOE_JOINTS = (10, 11)
 
+# Reference marker count that MoSh's default weights were tuned against
+# (chmosh.py:101, 460 — `num_train_markers = 46  # constant`). The data term is a
+# *sum* over markers, so it grows with marker count while the priors do not;
+# legacy divides wt_data by the actual count to normalize back to this reference,
+# which is what lets one set of weights transfer across marker layouts.
+NUM_TRAIN_MARKERS = 46
+
+
+def _frame_data_weights(
+    frames: List[FrameMarkers], enabled: bool, device: torch.device
+) -> torch.Tensor:
+    """(T,) per-frame multiplier on the data term: NUM_TRAIN_MARKERS / n_observed.
+
+    Mirrors legacy chmosh.py:603. Frames with fewer visible markers contribute a
+    smaller sum-of-squares, so without this the priors quietly win wherever
+    markers drop out. Returns all-ones when disabled.
+    """
+    if not enabled:
+        return torch.ones(len(frames), device=device)
+    counts = torch.tensor(
+        [max(int(f.obs_xyz.shape[0]), 1) for f in frames],
+        dtype=torch.float32,
+        device=device,
+    )
+    return NUM_TRAIN_MARKERS / counts
+
 
 def _body_pose_mask(optimize_toes: bool, device: torch.device) -> torch.Tensor:
     """(63,) multiplicative mask: 1.0 for free dims, 0.0 for frozen ones.
@@ -188,9 +214,11 @@ class StageICfg:
     anneal: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
     # Default weights match legacy stage I (chmosh.py opt_weights.smplh):
     #   wt_data=75, wt_init=300, wt_pose=3, wt_betas=10, wt_surf=10000.
-    # Tuned for marker-count of ~46; legacy scaled wt_data by (46/M), which we
-    # don't replicate — callers with very different M may want to adjust.
     wt_data: float = 75.0
+    # Scale wt_data by NUM_TRAIN_MARKERS / n_markers, as legacy does
+    # (chmosh.py:327). Keeps the data-vs-prior balance fixed as the marker layout
+    # changes. Set False to use wt_data exactly as given.
+    scale_wt_data_by_marker_count: bool = True
     wt_init: float = 300.0
     # VPoser prior on the freely-optimized body pose (analog of legacy wt_poseB,
     # which weighted a GMM over the same raw axis-angle pose).
@@ -264,6 +292,12 @@ class StageICfg:
 @dataclass
 class StageIICfg:
     wt_data: float = 1000.0
+    # Scale wt_data by NUM_TRAIN_MARKERS / n_observed_this_frame, as legacy does
+    # (chmosh.py:603). Unlike stage I this is *per frame*: when markers drop out,
+    # the data term shrinks (it is a sum), so the surviving markers would lose
+    # against the priors. Scaling up compensates. Has no effect on data with no
+    # occlusions, where every frame sees the same count.
+    scale_wt_data_by_marker_count: bool = True
     # VPoser prior on the free body pose (legacy wt_poseB, GMM over raw pose).
     wt_pose: float = 0.05
     # Constant-velocity prior. Applied in *pose* space (rad^2), matching legacy
@@ -392,6 +426,8 @@ def mosh_stagei(
 
     for step, anneal in enumerate(cfg.anneal):
         wt_data = cfg.wt_data / max(anneal, 1e-6)
+        if cfg.scale_wt_data_by_marker_count:
+            wt_data = wt_data * (NUM_TRAIN_MARKERS / max(M, 1))
         wt_init = cfg.wt_init * anneal
         wt_pose = cfg.wt_pose * anneal
         wt_betas = cfg.wt_betas * anneal
@@ -743,6 +779,9 @@ def _mosh_stageii_per_frame(
     out_transl = torch.zeros(T, 3, device=device)
     out_loss = torch.zeros(T, device=device)
     pose_mask = _body_pose_mask(cfg.optimize_toes, device)
+    frame_wt = _frame_data_weights(
+        observed_frames, cfg.scale_wt_data_by_marker_count, device
+    )
     hand_b1 = None if hand_pose is None else hand_pose.reshape(1, -1)
 
     # See the batched path: skin only the vertices the markers read.
@@ -837,7 +876,7 @@ def _mosh_stageii_per_frame(
                 se = ((sim_sub - frame.obs_xyz) ** 2).sum(dim=-1)  # (k,)
                 if marker_weights is not None:
                     se = se * marker_weights[frame.label_idx]
-                data_term = se.sum()
+                data_term = se.sum() * frame_wt[t]
                 pose_term = vposer.prior_term(pose_eff)
                 loss = (
                     cfg.wt_data * data_term + (cfg.wt_pose * wt_pose_mult) * pose_term
@@ -946,6 +985,9 @@ def _mosh_stageii_batched(
     out_body = torch.zeros(T, 63, device=device)
     out_loss = torch.zeros(T, device=device)
     pose_mask = _body_pose_mask(cfg.optimize_toes, device)
+    frame_wt = _frame_data_weights(
+        observed_frames, cfg.scale_wt_data_by_marker_count, device
+    )
 
     # Stage II holds shape and marker layout fixed, so only the ~150 vertices the
     # markers read ever matter. Skin just those instead of all 6890 (see
@@ -1025,6 +1067,9 @@ def _mosh_stageii_batched(
             )  # (chunk_T, S, 3)
             sim = synth_markers(verts, nn_idx_local, coeffs)  # (chunk_T, M, 3)
 
+            # Legacy's marker-count factor is per frame (chmosh.py:603), so it
+            # must weight each frame's residual before they are summed — a single
+            # factor on the total would use one frame's occlusion count for all.
             data_term = sim.new_zeros(())
             for i, frame in enumerate(chunk_frames):
                 if frame.obs_xyz.shape[0]:
@@ -1032,7 +1077,7 @@ def _mosh_stageii_batched(
                     se = ((sim_sub - frame.obs_xyz) ** 2).sum(dim=-1)
                     if marker_weights is not None:
                         se = se * marker_weights[frame.label_idx]
-                    data_term = data_term + se.sum()
+                    data_term = data_term + se.sum() * frame_wt[chunk_start + i]
 
             pose_term = vposer.prior_term(pose_eff)
 

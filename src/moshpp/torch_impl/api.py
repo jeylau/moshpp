@@ -41,6 +41,56 @@ from moshpp.torch_impl.markers import build_local_frame
 from moshpp.torch_impl.vposer_prior import FrozenVPoser
 
 
+def pick_stagei_frames(
+    markers: np.ndarray,  # (T, M, 3), NaN where missing
+    num_frames: int = 12,
+    seed: Optional[int] = 100,
+    least_avail_markers: float = 1.0,
+    strict: bool = True,
+) -> List[int]:
+    """Choose stage I reference frames, following legacy's `random_strict`
+    (frame_picker.py:load_marker_sessions_random_strict).
+
+    Only frames whose marker availability is at least `least_avail_markers`
+    (1.0 = every marker visible) are eligible; `num_frames` are then drawn at
+    random from those, seeded for reproducibility. Two reasons this beats evenly
+    spaced sampling: stage I solves for shape *and* marker placement, so frames
+    with occluded markers actively degrade it and are cheap to skip; and on
+    cyclic motion (a gait or stroke), evenly spaced indices can all land on the
+    same phase, leaving shape constrained by what is effectively one pose.
+
+    `strict=True` raises when too few frames qualify, as legacy does — a silent
+    fallback would hide that the mocap is worse than the caller assumed.
+    `strict=False` mirrors legacy's `random` type, lowering the threshold by 0.01
+    at a time until enough frames qualify.
+    """
+    T = markers.shape[0]
+    if not 0.0 < least_avail_markers <= 1.0:
+        raise ValueError("least_avail_markers must be in (0, 1]")
+    avail = (~np.any(np.isnan(markers), axis=-1)).sum(1) / markers.shape[1]
+
+    thresh = least_avail_markers
+    while True:
+        eligible = np.flatnonzero(avail >= thresh)
+        if len(eligible) >= num_frames:
+            break
+        if strict:
+            raise ValueError(
+                f"only {len(eligible)} of {T} frames have at least "
+                f"{thresh * 100:.1f}% of markers visible, need {num_frames}. "
+                f"Lower least_avail_markers, pass strict=False, or supply "
+                f"stagei_frame_ids explicitly."
+            )
+        thresh -= 0.01
+        if thresh < 0.01:
+            raise ValueError(
+                f"no marker-availability threshold yields {num_frames} frames."
+            )
+
+    rng = np.random.default_rng(seed)
+    return sorted(int(i) for i in rng.choice(eligible, num_frames, replace=False))
+
+
 def _pick_device(device: Optional[str]) -> torch.device:
     if device is not None:
         return torch.device(device)
@@ -62,6 +112,9 @@ def fit_smpl_to_markers(
     num_betas: int = 10,
     stagei_frame_ids: Optional[List[int]] = None,
     stagei_num_frames: int = 12,
+    stagei_seed: Optional[int] = 100,
+    stagei_least_avail_markers: float = 1.0,
+    stagei_strict_frames: bool = True,
     run_stage_i: bool = True,
     betas: Optional[Union[np.ndarray, torch.Tensor]] = None,
     m2b_distance: float = 0.0095,
@@ -195,11 +248,16 @@ def fit_smpl_to_markers(
         }
     elif run_stage_i:
         if stagei_frame_ids is None:
-            stagei_frame_ids = (
-                np
-                .linspace(0, markers.shape[0] - 1, num=stagei_num_frames)
-                .astype(int)
-                .tolist()
+            # Score availability over the markers actually being fitted. Passing
+            # the raw array would count labels we already dropped for having no
+            # vertex id, so a single unmapped label would make every frame fail
+            # the default 100% threshold.
+            stagei_frame_ids = pick_stagei_frames(
+                markers[:, [i for i, _ in kept]],
+                num_frames=stagei_num_frames,
+                seed=stagei_seed,
+                least_avail_markers=stagei_least_avail_markers,
+                strict=stagei_strict_frames,
             )
         logger.info(f"stage I frames: {stagei_frame_ids}")
         stagei_frames = _frames_from_array(
