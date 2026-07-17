@@ -23,38 +23,6 @@ from smplx.lbs import (
 )
 
 
-# MANO finger joint order within a 45-dim hand pose (15 joints x 3 axis-angle):
-# index 0-2, middle 3-5, pinky 6-8, ring 9-11, thumb 12-14. Axis 1 of each
-# metacarpophalangeal (the first joint of each finger) is the abduction axis.
-_MCP_JOINT = {"index": 0, "middle": 3, "pinky": 6, "ring": 9}
-# Sign that ADDUCTS (closes) each finger, measured per hand by perturbing each
-# axis and keeping whichever direction reduces finger spread. The right hand
-# mirrors the left, so getting this wrong splays a hand to ~103mm instead of
-# closing it to ~38mm.
-_ADDUCT_SIGN_L = {"index": +1.0, "middle": +1.0, "pinky": -1.0, "ring": -1.0}
-_ADDUCT_SIGN_R = {k: -v for k, v in _ADDUCT_SIGN_L.items()}
-
-
-def flat_fingers_together_hand(
-    adduction: float = 0.40, device: Union[str, torch.device] = "cpu"
-) -> torch.Tensor:
-    """A (90,) hand pose: straight fingers, held together. Use with
-    `flat_hand_mean=True`, whose zero pose is straight but splayed.
-
-    Rotates each finger's MCP about its abduction axis to close the splay while
-    leaving every flexion DoF at zero, so the hand stays flat. The default 0.40
-    rad was solved against a swimmer whose hand measures 38.7mm finger spread /
-    202.1mm wrist-to-fingertip reach; it yields 39.4mm / 198.9mm, where the two
-    smplx presets manage only 66.8/203.9 (splayed) and 43.6/174.6 (curled).
-    Re-solve `adduction` for a subject whose hand is held differently.
-    """
-    h = torch.zeros(90, device=device)
-    for name, j in _MCP_JOINT.items():
-        h[j * 3 + 1] = _ADDUCT_SIGN_L[name] * adduction  # left
-        h[45 + j * 3 + 1] = _ADDUCT_SIGN_R[name] * adduction  # right
-    return h
-
-
 class VertexSubset:
     """Skinning tensors sliced down to a fixed set of vertices, for a fixed shape.
 
@@ -123,8 +91,9 @@ class SMPLHBodyModel(nn.Module):
         Only ~15 of a hand's 45 DoF are observable from a typical finger-marker
         set, so the unobserved 30 are decided by whatever the pose prior pulls
         toward — which is why the preset visibly dictates the rendered hand.
-        Rather than pick the lesser evil, keep the straight preset and shift the
-        prior's target with `hand_pose_mean` (see `flat_fingers_together_hand`).
+        The straight preset is the safer target: its fingers sit ~35mm apart,
+        close to a real relaxed hand, and it cannot curl the fingers into each
+        other. Its extra splay costs nothing measurable in marker error.
         """
         super().__init__()
         self.device = torch.device(device)

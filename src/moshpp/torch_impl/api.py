@@ -86,11 +86,8 @@ def fit_smpl_to_markers(
 
     ``flat_hand_mean=True`` (default) gives a straight hand; the MANO mean
     (``False``, legacy's ``use_hands_mean: true``) bakes in ~3.3 rad of curl and
-    renders visibly half-closed. Most hand DoF are unobservable from finger
-    markers, so pair this with ``StageICfg.hand_pose_mean`` (see
-    ``flat_fingers_together_hand``) to say what those DoF should look like.
-    Stage I then fits a static per-subject hand on top, which is what makes
-    finger markers informative about wrist flexion/extension.
+    renders visibly half-closed. Stage I fits a static per-subject hand on top,
+    which is what makes finger markers informative about wrist flexion/extension.
     """
     assert markers.ndim == 3 and markers.shape[2] == 3, "markers must be (T, M, 3)"
     assert markers.shape[1] == len(labels), (

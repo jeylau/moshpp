@@ -223,10 +223,13 @@ class StageICfg:
     # gets its own (earlier) schedule.
     hand_pose_free_from_step: int = 1
     # Target the hand-pose prior pulls toward, as a (90,) offset from the body
-    # model's own hand zero. Defaults to that zero. With `flat_hand_mean=True`
-    # the zero is a straight but splayed hand; pass
-    # `flat_fingers_together_hand()` to target a straight hand held together,
-    # which is what the unobservable ~30 DoF will then render as.
+    # model's own hand zero. Defaults to that zero, which under
+    # `flat_hand_mean=True` is a straight hand with the fingers a natural ~35mm
+    # apart — a good target, since most hand DoF are unobservable from finger
+    # markers and render as whatever this pulls toward. Only override with a
+    # pose you have actually looked at: targets that merely match a summary
+    # statistic (e.g. mean finger spread) can satisfy it by curling the fingers
+    # through each other.
     hand_pose_mean: Optional[torch.Tensor] = None
     # Per-marker multiplier on the init + surf terms, keyed by label. Values
     # below 1.0 let a marker relocate further from its seed vertex.
